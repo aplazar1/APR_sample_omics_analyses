@@ -1,0 +1,185 @@
+---
+title: "Gondal_showcase: exploratory data analysis"
+output: html_document
+author: alma plaza-rodriguez
+date: "2025-03-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here, I am coinducting a standard QC analysis on the ICB data from Gondal et al.
+```{r, message=FALSE, warning=FALSE}
+library(anndata)
+library(dplyr)
+library(tidyverse)
+library(BiocManager)
+library(zellkonverter)
+library(SingleCellExperiment)
+library(Seurat)
+library(readr)
+library(DropletUtils)
+library(scuttle)
+library(scran)
+library(igraph)
+library(scry)
+library(network)
+library(sna)
+library(scales)
+library(GGally)
+library(intergraph)
+```
+Load the data and isolate a small subset. To start with, I perform initial QC on ER+ breast cancer cells (start with pre-ICB treatment first).
+```{r}
+
+Gondal_ICB<-as.SingleCellExperiment(readRDS("~/Documents/APR_data_sets/Gondal_et_al_ICB_scRNASeq/Gondal.rds"))
+#subset by pre-treatment breast cancer cells 
+pre_treat_ER_pos<-Gondal_ICB[, Gondal_ICB@colData$Cancer_type_update=="ER+" & Gondal_ICB@colData$pre_post=="Pre" & Gondal_ICB@colData$tissue=="breast" & Gondal_ICB@colData$cell_type=="malignant cell"  ]
+
+##extract counts
+counts_assay<- assay(pre_treat_ER_pos, "counts")
+
+```
+Part1: preliminary QC and normalizatioon
+
+Rank the barcodes by number of UMIs and to estimate the knee and inflection point of the distribution. Plot Rank vs total UMI.
+```{r}
+## A) rank the barcodes by number of UMIs and to estimate the knee and inflection point of the distribution
+library(DropletUtils)
+library(scuttle)
+bcrank <-barcodeRanks(counts_assay)
+
+
+library(ggplot2)
+# Only show unique points for plotting speed.
+uniq <- !duplicated(bcrank$rank)
+bcrank_clean <- bcrank[uniq, ]
+bcrank_clean <- bcrank_clean[bcrank_clean$rank > 0 & bcrank_clean$total > 0, ]
+
+# Plot with log scales on both axes
+plot(bcrank_clean$rank, bcrank_clean$total, log="xy",
+     xlab="Rank", ylab="Total UMI count")
+
+abline(h=metadata(bcrank)$inflection, col="darkgreen", lty=2)
+abline(h=metadata(bcrank)$knee, col="dodgerblue", lty=2)
+
+legend("bottomleft", legend=c("Inflection", "Knee"), 
+       col=c("darkgreen", "dodgerblue"), lty=2, cex=1.2)
+```
+B) Normalize the data
+```{r}
+library(scater)
+
+assay(pre_treat_ER_pos, "normalized_log2_counts") <- log2(NormalizeData(assay(pre_treat_ER_pos, "counts"), normalization.method="RC")+1)
+```
+Part 2 Dimensionality reduction
+
+```{r, echo=TRUE}
+
+#D1) Perform PCA
+reducedDim(pre_treat_ER_pos, "PCA")<- scater::calculatePCA(assay(pre_treat_ER_pos, "normalized_log2_counts"))
+# Extract PCA results (if available)
+pca_results <- reducedDim(pre_treat_ER_pos, "PCA")
+
+#D2) Run t-SNE using Rtsne
+library(Rtsne)
+tsne_results <- Rtsne(pca_results, perplexity = 30, pca = FALSE)
+
+# Store the results in the SingleCellExperiment object
+reducedDim(pre_treat_ER_pos, "TSNE") <- tsne_results$Y
+
+##plot PCA and tSNE
+plotPCA(pre_treat_ER_pos,  colour_by = "cell_type")
+plotTSNE(pre_treat_ER_pos,  colour_by = "cell_type")
+
+```
+C) check Mito percent
+```{r}
+##C) check Mito percent
+stats <- perCellQCMetrics(pre_treat_ER_pos,
+                          subsets=list(Mito=which(rowData(pre_treat_ER_pos)$location=="MT")))
+high.mito <- isOutlier(stats$subsets_Mito_percent, type="higher")
+table(high.mito)
+
+
+colData(pre_treat_ER_pos) <- cbind(colData(pre_treat_ER_pos), stats)
+pre_treat_ER_pos$discard <- high.mito
+
+##Note: QC had already been performed on this dataset and all Mito counts were already discarded
+
+plotColData(pre_treat_ER_pos, y="detected",
+            colour_by="discard")
+
+plotColData(pre_treat_ER_pos, x="sum", y="subsets_Mito_percent",
+            colour_by="discard") + scale_x_log10()
+
+plotTSNE(pre_treat_ER_pos, colour_by="subsets_Mito_percent")
+
+```
+Part3 Identify HGVs 
+```{r}
+library(scran)
+HGVs <- scran::modelGeneVar(pre_treat_ER_pos)
+
+# Visualizing the fit:
+##Heteroskedastic mean vs variance plot
+fit.HGVs <- metadata(HGVs)
+plot(fit.HGVs$mean, fit.HGVs$var, xlab="Mean of log-expression",
+     ylab="Variance of log-expression")
+curve(fit.HGVs$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+
+top.HGVs_pre <- getTopHVGs(HGVs, n=1000)
+head(top.HGVs_pre)
+```
+Part4 QC: Doublet identification
+```{r}
+##perform doublet identification
+library(scDblFinder)
+dbl.dens <- computeDoubletDensity(pre_treat_ER_pos, subset.row=top.HGVs_pre, 
+                                  d=ncol(reducedDim(pre_treat_ER_pos)))
+pre_treat_ER_pos$DoubletScore <- dbl.dens
+summary(dbl.dens)
+plotTSNE(pre_treat_ER_pos, colour_by="DoubletScore")
+
+##define threshold to identify putative doublets
+dbl.calls <- doubletThresholding(data.frame(score=dbl.dens),
+                                 method="griffiths", returnType="call")
+summary(dbl.calls)
+##remove doublets before continuing analysis
+pre_treat_ER_pos <- pre_treat_ER_pos[, dbl.calls == "singlet"]
+```
+Part 5 use GLMPCA for dimensionality reduction of singlet HGVs
+```{r}
+library(scran)
+HGVs <- scran::modelGeneVar(pre_treat_ER_pos)
+
+# Visualizing the fit:
+##Heteroskedastic mean vs variance plot
+fit.HGVs <- metadata(HGVs)
+plot(fit.HGVs$mean, fit.HGVs$var, xlab="Mean of log-expression",
+     ylab="Variance of log-expression")
+curve(fit.HGVs$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+
+top.HGVs_pre <- getTopHVGs(HGVs, n=1000)
+head(top.HGVs_pre)
+
+###GLM PCA for dimensionality reduction on the Highly variable genes
+library(scry)
+set.seed(100000)
+filtered <- pre_treat_ER_pos[top.HGVs_pre,]
+filtered <- GLMPCA(filtered, L=10, minibatch="stochastic")
+plotReducedDim(filtered, "GLMPCA")
+```
+
+Part 6 Clustering using louvain clustering via shared nearest neighborgs graph
+
+```{r}
+g <- scran::buildSNNGraph(filtered, k=10, use.dimred = 'GLMPCA')
+clust <- igraph::cluster_louvain(g)
+
+
+filtered$Louvain <- factor(membership(clust))
+plotTSNE(filtered, colour_by="Louvain")
+
+```
